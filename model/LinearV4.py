@@ -6,7 +6,30 @@ import joblib  # Library for saving and loading models
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import sqlite3
 
+# Define the database and table names
+table_name = 'house_prices'
+
+# 1. Automatically detect the directory where this script is located
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 2. Go one step back (..) to the root, then enter data/db/prices.db
+db_filename = os.path.normpath(os.path.join(current_dir, "../data/db/prices.db"))
+
+print(f"🗄️ Connecting to database at: {db_filename}")
+
+# 3. Connect to the existing SQLite database using the absolute path
+conn = sqlite3.connect(db_filename)
+
+df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
+
+# Ensure that the 'obj_telekomInternetProductAvailable' column is treated as an object (string) type for safe processing
+df['obj_telekomInternetProductAvailable'] = df['obj_telekomInternetProductAvailable'].astype(object)
+
+# 3. Always close the database connection when done
+conn.close()
+""" 
 print("⏳ 1️⃣ Loading, cleaning, and preparing dataset for Linear Regression...")
 
 # Automatically detect the current directory where this script is located
@@ -19,7 +42,7 @@ print(f"📂 Reading data from: {data_path}")
 
 # Read the raw dataset
 df = pd.read_csv(data_path)
-
+ """
 # Define the lower and upper quantile thresholds (1% and 99%) for outlier removal
 lower_q = 0.01
 upper_q = 0.99
@@ -67,8 +90,14 @@ X_numeric = df.select_dtypes(include=[np.number, bool]).copy()
 cols_to_drop = ['obj_purchasePrice', 'obj_purchasePrice_per_qm', 'obj_regio1']
 X = X_numeric.drop(columns=[col for col in cols_to_drop if col in X_numeric.columns], errors='ignore')
 
-# Fill any remaining missing values (NaN) with 0 for calculation safety
-X = X.fillna(0)
+
+# تعويض القيم المفقودة في الأعمدة الرقمية بالقيمة الوسطية (Median) لكل عمود
+for col in X.columns:
+    # التأكد من أن العمود رقمي وليس متغير فئوي (Dummy) مرمز بـ 0 و 1
+    if X[col].dtype in [np.float64, np.int64]:
+        mean_value = X[col].mean()
+        X[col] = X[col].fillna(mean_value)
+
 
 # Split data into 80% training and 20% testing sets
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)

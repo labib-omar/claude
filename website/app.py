@@ -1,109 +1,135 @@
-import os
-import sys
 import numpy as np
 import pandas as pd
 import joblib
 from flask import Flask, request, jsonify, render_template
 from pathlib import Path
 
-# --- 1. INITIALIZE FLASK & MODEL ---
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
-# Get the current directory where this script resides
 CURRENT_DIR = Path(__file__).parent.resolve()
+MODEL_PATH = CURRENT_DIR.parent / "model" / "xgb_estate_model.joblib"
 
-# CONNECTING NEW JOBLIB HERE: Points to your new LinearV4.joblib
-MODEL_PATH = CURRENT_DIR.parent / "model" / "LinearV4.joblib"
+print(f"Loading model bundle from {MODEL_PATH}...")
 
-print(f"Loading raw Linear Regression model from {MODEL_PATH}...")
-model = joblib.load(MODEL_PATH)
-print("✓ Model successfully initialized!")
+bundle = joblib.load(MODEL_PATH)
+model = bundle["model"]
+encoder = bundle["encoder"]
+lookup = bundle["lookup"]
 
-# Retrieve the exact features the model was trained on to ensure matching column structures
-try:
-    # If your model stores feature names (scikit-learn 1.0+)
-    MODEL_FEATURES = model.feature_names_in_
-except AttributeError:
-    # CRITICAL: If the above fails, paste the output list of X_train.columns from your training script here
-    MODEL_FEATURES = [] 
+location_popularity_map = lookup["location_popularity_map"]
+location_popularity_default = lookup["location_popularity_default"]
+space_to_county_avg_map = lookup["space_to_county_avg_map"]
+space_to_county_avg_default = lookup["space_to_county_avg_default"]
+categorical_cols = lookup["categorical_cols"]
+
+MODEL_FEATURES = list(model.feature_names_in_)
+
+print(f"✓ Ready. Features: {MODEL_FEATURES}")
+
 
 def engineer_web_features(raw_data: dict) -> pd.DataFrame:
-    """Takes web inputs and safely aligns them with the exact training feature schema
-
-    without fragmenting the DataFrame or erasing input data.
-    """
-    def safe_float(value, default=0.0):
+    def safe_float(val, default):
         try:
-            return float(value)
+            return float(val)
         except (TypeError, ValueError):
             return default
 
-    # 1. Start with a baseline row containing 0 for EVERY single expected model feature
-    # This completely eliminates the loop warning and prevents resetting data to 0
-    full_feature_row = {col: 0 for col in MODEL_FEATURES} if len(MODEL_FEATURES) > 0 else {}
+    living_space = safe_float(raw_data.get("obj_livingSpace"), 120.0)
+    year_constructed = safe_float(raw_data.get("obj_yearConstructed"), 1973.0)
+    geo_plz = safe_float(raw_data.get("geo_plz"), 29468.0)
+    no_rooms = safe_float(raw_data.get("obj_noRooms"), 4.0)
 
-    # 2. Extract base features from raw user web submission
-    living_space = safe_float(raw_data.get('obj_livingSpace'), default=120.0)
-    
-    # Update numerical base columns if they exist in your model features
-    if "obj_livingSpace" in full_feature_row:
-        full_feature_row["obj_livingSpace"] = living_space
+    geo_krs = str(raw_data.get("geo_krs", "Hannover_Kreis"))
+    obj_regio3 = str(raw_data.get("obj_regio3", "other"))
+    obj_condition = str(raw_data.get("obj_condition", "well_kept"))
+    obj_firingTypes = str(raw_data.get("obj_firingTypes", "gas"))
+    obj_cellar = str(raw_data.get("obj_cellar", "n"))
 
-    # 3. Create the text categories to match against dummies
-    user_regio3 = str(raw_data.get('obj_regio3', 'other'))
-    user_condition = str(raw_data.get('obj_condition', 'well_kept'))
+    obj_age = 2026 - year_constructed
+    space_per_room = living_space / (no_rooms + 0.1)
 
-    # 4. Manually set the dummy columns to 1 for the selected categories
-    # This mirrors exactly what pd.get_dummies(..., drop_first=True) did during training
-    target_regio3_col = f"obj_regio3_{user_regio3}"
-    target_condition_col = f"obj_condition_{user_condition}"
+    location_popularity = location_popularity_map.get(
+        obj_regio3,
+        location_popularity_default
+    )
 
-    if target_regio3_col in full_feature_row:
-        full_feature_row[target_regio3_col] = 1
-    if target_condition_col in full_feature_row:
-        full_feature_row[target_condition_col] = 1
+    county_avg = space_to_county_avg_map.get(
+        geo_krs,
+        space_to_county_avg_default
+    )
 
-    # 5. Convert the fully prepared dictionary to a DataFrame all at once
-    # If MODEL_FEATURES was empty, fallback to basic structure
-    if full_feature_row:
-        X_web = pd.DataFrame([full_feature_row])
-        X_web = X_web[MODEL_FEATURES]  # Enforce exact training column order
-    else:
-        # Fallback if model features couldn't be automatically inspected
-        processed_row = {
-            "obj_livingSpace": living_space,
-            f"obj_regio3_{user_regio3}": 1,
-            f"obj_condition_{user_condition}": 1
-        }
-        X_web = pd.DataFrame([processed_row]).fillna(0)
+    space_to_county_avg = living_space / (county_avg + 0.1)
 
-    return X_web
-# --- 2. ROUTES ---
-@app.route('/')
+    row = {
+        "obj_yearConstructed": year_constructed,
+        "obj_firingTypes": obj_firingTypes,
+        "obj_cellar": obj_cellar,
+        "obj_livingSpace": living_space,
+        "geo_krs": geo_krs,
+        "obj_condition": obj_condition,
+        "geo_plz": geo_plz,
+        "obj_noRooms": no_rooms,
+        "obj_regio3": obj_regio3,
+        "obj_age": obj_age,
+        "space_per_room": space_per_room,
+        "location_popularity": location_popularity,
+        "space_to_county_avg": space_to_county_avg,
+    }
+
+    X = pd.DataFrame([row])[MODEL_FEATURES]
+
+    existing_cats = [c for c in categorical_cols if c in X.columns]
+    X[existing_cats] = encoder.transform(X[existing_cats])
+
+    return X
+
+
+@app.route("/")
 def home():
-    return render_template('vorhersage.html')
+    return render_template("index.html")
 
-@app.route('/predict', methods=['POST'])
+
+@app.route("/vorhersage")
+def vorhersage():
+    return render_template("vorhersage.html")
+
+
+@app.route("/datenschutz")
+def datenschutz():
+    return render_template("datenschutz.html")
+
+
+@app.route("/kontakt")
+def kontakt():
+    return render_template("kontakt.html")
+
+
+@app.route("/mehrÜberImmobilien")
+def mehrÜberImmobilien():
+    return render_template("mehrÜberImmobilien.html")
+
+@app.route("/niedersachsen_price_heatmap")
+def niedersachsen_price_heatmap():
+    return render_template("niedersachsen_price_heatmap.html")
+
+
+@app.route("/predict", methods=["POST"])
 def predict():
     try:
         raw_data = request.get_json()
-        df_engineered = engineer_web_features(raw_data)
-        
-        # Compute estimation directly using the raw Linear Regression model
-        prediction = model.predict(df_engineered)[0]
-        
-        # Prevent unrealistic negative price predictions
-        prediction = max(0, prediction)
-        
-        formatted_price = f"{prediction:,.2f} EUR"
-        return jsonify({"predicted_price": formatted_price})
-        
+        X = engineer_web_features(raw_data)
+
+        prediction_log = model.predict(X)[0]
+        prediction_eur = max(0.0, float(np.expm1(prediction_log)))
+
+        return jsonify({
+            "predicted_price": f"{prediction_eur:,.2f} EUR"
+        })
+
     except Exception as e:
-        print(f"Prediction Error: {e}")
+        print(f"Prediction error: {e}")
         return jsonify({"error": str(e)}), 400
 
-if __name__ == '__main__':
-    
-    model = joblib.load("model/LinearV4.joblib")
-    print(list(model.feature_names_in_))
+
+if __name__ == "__main__":
     app.run(debug=True, port=5000)
